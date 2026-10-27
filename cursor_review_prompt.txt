@@ -1,35 +1,115 @@
-あなたはネットワーク運用自動化に強いシニアエンジニアです。
-添付の Tera Term TTL マクロ（capture.ttl）を、Cisco IOS / IOS-XE の
-複数機器・複数showコマンド取得用途としてレビューしてください。
+あなたは、Cisco IOS / IOS-XE、Tera Term Macro (TTL)、Windows PowerShell、
+ネットワーク運用自動化、認証情報保護に詳しいシニアエンジニアです。
 
-目的:
+このリポジトリの Tera Term マクロ一式を、既存構成を尊重しながらレビューしてください。
+不要な全面書き換えや機能追加はせず、要求を満たすための最小変更を優先してください。
+
+# 目的
+
+複数のCisco IOS / IOS-XE機器に対して複数のshowコマンドを取得します。
+
 - hosts.txt: 1行1ホスト
-- commands.txt: 1行1コマンド
-- 実行日時（YYYYMMDD_HHMM）フォルダを作る
-- 通常取得は <host>_log.txt に保存
-- TFTP redirect時は、Cisco側でredirectを実行し、TFTP先ファイルの確認や自動リトライは行わない
-- Ciscoのプロンプトが戻っていない場合は、その機器の処理を打ち切る
-- 認証情報はファイルへ保存しない
+- commands.txt: 1行1showコマンド
+- 実行日時フォルダを作成
+- 通常取得は <host>_log.txt
+- 認証・特権EXEC到達が全方式で失敗したホストは <host>_NG.txt
+- TFTP redirectモードではCisco機器からTFTPサーバーへ直接送信
+- TFTP先の存在確認、0KB確認、自動リトライは行わない
 
-レビュー方針:
-1. Tera Term公式TTL仕様との構文整合性を最優先で確認する
-2. Cisco IOS / IOS-XEのshow redirectの挙動を前提に、安全性を確認する
-3. 接続失敗、enable失敗、コマンドtimeout、TFTP redirect timeout、
-   同一分再実行、ログファイル作成失敗を確認する
-4. 不要な全面書き換えはしない。問題がある箇所のみ最小変更する
-5. 認証情報をログやファイルへ出さない
-6. 変更後に、どの要件をどう満たしたかをチェックリストで示す
-7. 実機未検証事項を断定しない
+# 必須の認証仕様
 
-特に確認してほしい点:
-- waitregexのプロンプト検出がCisco IOS/IOS-XEで安全か
-- connectの戻り値と認証完了タイミング
-- logopen/fileopen/filesearch/foldercreateの戻り値扱い
-- タイムアウト時に次コマンドを送らない設計になっているか
-- TTLの演算子、while、elseif、文字列クォートが正しいか
+各ホストで、次の順に1回ずつ試行してください。
 
-出力:
-- 重大度順の指摘
-- 必要な最小修正版
-- テスト項目
-- 未確認事項
+1. TACACSアカウントによるSSH
+2. 共通アカウントによるSSH
+3. 共通アカウントによるTelnet
+4. 全方式失敗時はコマンド取得を行わず <host>_NG.txt を作成
+
+TACACS SSHはログイン直後に特権EXEC (#) へ到達する想定です。
+TACACS認証に成功しても初期プロンプトが > の場合は、その方式では取得せず、
+enableを試さずに共通SSHへフォールバックしてください。
+
+共通SSH / 共通Telnetで初期プロンプトが > の場合は enable を実行し、
+方式ごとに登録したenableパスワードで # へ到達できた場合だけ取得を開始してください。
+
+「接続できた」「認証できた」だけでは成功扱いにせず、
+取得開始条件を特権EXEC (#) 到達まで含めてください。
+
+# 資格情報の要件
+
+端末は共有利用を想定しています。平文資格情報を以下へ残さないでください。
+
+- Gitリポジトリ
+- TTL / INI / hosts.txt / commands.txt
+- 実行ログ
+- capture_summary.txt
+- <host>_NG.txt
+- PowerShellスクリプト内の固定値
+
+資格情報は setup-credentials.ps1 で登録し、
+Windows DPAPIを利用して現在のWindowsユーザーに紐づけて暗号化保存する構成を前提とします。
+暗号化キーを同じフォルダへ保存する方式へ変更しないでください。
+
+start-capture.ps1 が実行時だけ復号し、
+子プロセスへ必要な値をプロセススコープの環境変数で渡す設計を確認してください。
+終了処理では環境変数とTTL側の資格情報変数を可能な範囲でクリアしてください。
+
+同一Windowsログオンアカウントを複数人で共有した場合、
+DPAPIでは利用者同士を分離できない点は制限事項として明示してください。
+
+Telnetは通信経路上で資格情報を暗号化しないため、
+最終フォールバックに限定し、このリスクをREADMEへ明記してください。
+
+# 安全性レビュー
+
+次を重点確認してください。
+
+1. Tera Term公式TTL仕様との構文整合性
+2. get/setする環境変数名の一致
+3. TTSSH connect文字列のクォートと認証情報漏えい
+4. 初回SSHホスト鍵確認・認証失敗ダイアログで意図しないフォールバックをしないか
+5. TACACS成功 + > のときにenableを送らず共通SSHへ進むこと
+6. 共通SSH失敗時に共通Telnetへ進むこと
+7. 全方式失敗時に <host>_NG.txt を作成し、秘密情報を書かないこと
+8. enable失敗時に取得コマンドを送らないこと
+9. コマンドtimeout時に後続コマンドを送らないこと
+10. TFTP redirect timeout時に後続コマンドを送らないこと
+11. logopen / fileopen / filesearch / foldercreate 等の戻り値
+12. 同一分再実行時のファイル衝突
+13. TTLの if/elseif/endif、while/endwhile、for/next、文字列クォート
+14. PowerShellのDPAPI保存・復号と例外時cleanup
+15. ソース、ログ、summary、NGファイルに資格情報が漏れないこと
+
+# 変更方針
+
+- 既存の構成、命名、TFTP方針を維持する
+- 問題がない部分は変更しない
+- 認証失敗を無制限に自動再試行しない
+- SSHホスト鍵を無条件で自動受諾しない
+- 本番機器の設定変更コマンドを追加しない
+- 実機未検証事項を「確認済み」と書かない
+- 不明なAAA挙動を推測で補完しない
+
+# 検証
+
+可能な範囲で静的検査・テストを実行し、少なくとも次のケースを確認してください。
+
+- TACACS SSH成功 (#)
+- TACACS SSH失敗 → 共通SSH成功
+- TACACS SSH成功だが > → 共通SSHへフォールバック
+- TACACS SSH / 共通SSH失敗 → 共通Telnet成功
+- 共通SSH / Telnetで > → enable成功
+- enable失敗 → 次方式またはNG
+- 全方式失敗 → <host>_NG.txt
+- 認証情報が出力ファイルへ含まれない
+- コマンドtimeout
+- TFTP redirect timeout
+
+# 出力
+
+1. 結論
+2. 重大度順の指摘
+3. 実施した最小変更
+4. 検証結果
+5. 未実施・未確認事項
+6. 本番導入前の確認手順
