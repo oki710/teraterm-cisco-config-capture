@@ -45,7 +45,7 @@ powershell.exe -NoProfile -File .\setup-credentials.ps1
 start-capture.cmd
 ```
 
-`start-capture.ps1` がDPAPI保護された資格情報を復号し、当該プロセスの環境変数だけへ渡してから `capture.ttl` を起動します。終了時にランチャー側の環境変数を削除します。
+`start-capture.ps1` がDPAPI保護された資格情報を復号し、当該プロセスの環境変数だけへ渡してから `capture.ttl` を起動します。TTLは `capture.ini` を指定した専用Tera Termを起動し、既存の接続済み／リンク済みセッションは再利用しません。終了時にランチャー側の環境変数を削除します。
 
 ## 認証フォールバック
 
@@ -121,6 +121,7 @@ TFTPサーバーはTera Term実行PCとは別機器でも問題ありません�
 ## 構成
 
 - `capture.ttl` : 本体
+- `capture.ini` : 自動ログ・履歴・パスワード保持等を抑止する専用Tera Term設定
 - `setup-credentials.ps1` : DPAPI資格情報登録
 - `start-capture.ps1` : 復号・起動ランチャー
 - `start-capture.cmd` : ダブルクリック用ランチャー
