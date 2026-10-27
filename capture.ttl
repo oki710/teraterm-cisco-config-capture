@@ -36,6 +36,7 @@ getdir base_dir
 makepath hosts_file base_dir 'hosts.txt'
 makepath commands_file base_dir 'commands.txt'
 makepath logs_root base_dir 'logs'
+makepath ini_path base_dir 'capture.ini'
 
 filesearch hosts_file
 if result = 0 then
@@ -46,6 +47,12 @@ endif
 filesearch commands_file
 if result = 0 then
     messagebox 'commands.txt が見つかりません。TTL と同じフォルダに置いてください。' 'Error'
+    end
+endif
+
+filesearch ini_path
+if result = 0 then
+    messagebox 'capture.ini が見つかりません。TTL と同じフォルダに置いてください。' 'Error'
     end
 endif
 
@@ -159,14 +166,21 @@ if capture_mode = 1 then
 endif
 
 ; Link to a dedicated Tera Term instance before credentials are used.
+; Never reuse an existing linked Tera Term window on a shared terminal.
 testlink
-if result = 2 then
+if result <> 0 then
     fileclose summary_fh
-    messagebox '接続済みTera Termからではなく、start-capture.cmd で起動してください。' 'Error'
+    messagebox '既存のTera Termセッションからではなく、start-capture.cmd で単独起動してください。' 'Error'
     goto cleanup_secrets
 endif
-if result = 0 then
-    connect '/DS /NOLOG'
+sprintf2 bootstrap '/DS /NOLOG /AUTOWINCLOSE=off /F="%s"' ini_path
+connect bootstrap
+bootstrap = ''
+testlink
+if result <> 1 then
+    fileclose summary_fh
+    messagebox '専用Tera Termを起動できませんでした。capture.ini とTera Termの配置を確認してください。' 'Error'
+    goto cleanup_secrets
 endif
 
 fileopen hosts_fh hosts_file 0 1
