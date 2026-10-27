@@ -1,0 +1,27 @@
+# Runtime inputs / outputs
+logs/
+*_NG.txt
+*.log
+*.tsv
+*.csv
+*.cfg
+*.conf
+
+# Never commit credentials or local secret material
+credentials*
+secrets*
+.env
+.env.*
+*.key
+*.pem
+*.pfx
+*.p12
+*.clixml
+
+# Local/editor files
+TERATERM.INI
+*.local.ini
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
