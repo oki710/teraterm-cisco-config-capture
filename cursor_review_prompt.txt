@@ -1,0 +1,35 @@
+あなたはネットワーク運用自動化に強いシニアエンジニアです。
+添付の Tera Term TTL マクロ（capture.ttl）を、Cisco IOS / IOS-XE の
+複数機器・複数showコマンド取得用途としてレビューしてください。
+
+目的:
+- hosts.txt: 1行1ホスト
+- commands.txt: 1行1コマンド
+- 実行日時（YYYYMMDD_HHMM）フォルダを作る
+- 通常取得は <host>_log.txt に保存
+- TFTP redirect時は、Cisco側でredirectを実行し、TFTP先ファイルの確認や自動リトライは行わない
+- Ciscoのプロンプトが戻っていない場合は、その機器の処理を打ち切る
+- 認証情報はファイルへ保存しない
+
+レビュー方針:
+1. Tera Term公式TTL仕様との構文整合性を最優先で確認する
+2. Cisco IOS / IOS-XEのshow redirectの挙動を前提に、安全性を確認する
+3. 接続失敗、enable失敗、コマンドtimeout、TFTP redirect timeout、
+   同一分再実行、ログファイル作成失敗を確認する
+4. 不要な全面書き換えはしない。問題がある箇所のみ最小変更する
+5. 認証情報をログやファイルへ出さない
+6. 変更後に、どの要件をどう満たしたかをチェックリストで示す
+7. 実機未検証事項を断定しない
+
+特に確認してほしい点:
+- waitregexのプロンプト検出がCisco IOS/IOS-XEで安全か
+- connectの戻り値と認証完了タイミング
+- logopen/fileopen/filesearch/foldercreateの戻り値扱い
+- タイムアウト時に次コマンドを送らない設計になっているか
+- TTLの演算子、while、elseif、文字列クォートが正しいか
+
+出力:
+- 重大度順の指摘
+- 必要な最小修正版
+- テスト項目
+- 未確認事項
