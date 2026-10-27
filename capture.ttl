@@ -1,0 +1,403 @@
+; ============================================================================
+; Cisco IOS / IOS-XE multi-device command capture macro for Tera Term
+; Version: 0.2
+;
+; Files:
+;   hosts.txt     : one host/IP per line
+;   commands.txt  : one EXEC "show" command per line
+;
+; Output:
+;   logs\YYYYMMDD_HHMM\<host>_log.txt
+;   logs\YYYYMMDD_HHMM\capture_summary.txt
+;
+; Modes:
+;   0 = terminal logging (all command output -> <host>_log.txt)
+;   1 = Cisco "show ... | redirect tftp://..."
+;
+; TFTP mode policy:
+;   - Macro only executes redirect and records the Cisco-side result.
+;   - Destination file size / 0-byte verification is intentionally out of scope.
+;   - No automatic retry is performed.
+;
+; Requirements:
+;   - Tera Term Macro with: foldercreate, waitregex, strreplace
+; ============================================================================
+
+; ---- Tunables ---------------------------------------------------------------
+LOGIN_TIMEOUT        = 20
+COMMAND_TIMEOUT      = 180
+RECONNECT_WAIT_SEC   = 2
+
+; ---- Locate working files ---------------------------------------------------
+getdir base_dir
+makepath hosts_file base_dir 'hosts.txt'
+makepath commands_file base_dir 'commands.txt'
+makepath logs_root base_dir 'logs'
+
+filesearch hosts_file
+if result = 0 then
+    messagebox 'hosts.txt が見つかりません。TTL と同じフォルダに置いてください。' 'Error'
+    end
+endif
+
+filesearch commands_file
+if result = 0 then
+    messagebox 'commands.txt が見つかりません。TTL と同じフォルダに置いてください。' 'Error'
+    end
+endif
+
+foldercreate logs_root
+
+; ---- Create unique run folder: YYYYMMDD_HHMM[_02...] -----------------------
+gettime run_id '%Y%m%d_%H%M'
+run_name = run_id
+makepath run_dir logs_root run_name
+
+run_suffix = 2
+filesearch run_dir
+while result = 1
+    sprintf2 run_name '%s_%02d' run_id run_suffix
+    makepath run_dir logs_root run_name
+    run_suffix = run_suffix + 1
+    filesearch run_dir
+endwhile
+
+foldercreate run_dir
+if result <> 0 then
+    messagebox 'ログ出力フォルダを作成できませんでした。' 'Error'
+    end
+endif
+
+makepath summary_file run_dir 'capture_summary.txt'
+fileopen summary_fh summary_file 0
+if summary_fh = -1 then
+    messagebox 'capture_summary.txt を作成できませんでした。' 'Error'
+    end
+endif
+
+filewriteln summary_fh 'run,host,item,result,detail'
+
+; ---- Select capture mode ----------------------------------------------------
+inputbox '0 = 通常ログ取得（host_log.txt） / 1 = TFTP redirect' 'Capture mode' '0'
+mode_text = inputstr
+str2int capture_mode mode_text
+if result = 0 then
+    capture_mode = 0
+endif
+if capture_mode <> 1 then
+    capture_mode = 0
+endif
+
+; ---- Credentials: runtime only, never written to files ----------------------
+inputbox 'SSH ユーザー名' 'Cisco Login'
+ssh_user = inputstr
+
+passwordbox 'SSH パスワード' 'Cisco Login'
+ssh_pass = inputstr
+
+passwordbox 'enable パスワード（不要なら空欄）' 'Cisco Enable'
+enable_pass = inputstr
+
+; Escape quotes for TTSSH command line argument.
+ssh_user_arg = ssh_user
+ssh_pass_arg = ssh_pass
+strreplace ssh_user_arg 1 '"' '""'
+strreplace ssh_pass_arg 1 '"' '""'
+
+; ---- TFTP settings -----------------------------------------------------------
+if capture_mode = 1 then
+    inputbox 'TFTPサーバーのIPアドレスまたは名前' 'TFTP Server'
+    tftp_server = inputstr
+endif
+
+; ---- Link MACRO to a dedicated Tera Term instance without opening dialog ----
+testlink
+if result = 2 then
+    fileclose summary_fh
+    messagebox '既存の接続済みTera Termからではなく、TTPMACRO.EXE でこのTTLを単独起動してください。' 'Error'
+    ssh_pass = ''
+    ssh_pass_arg = ''
+    enable_pass = ''
+    end
+endif
+
+if result = 0 then
+    connect '/DS /NOLOG'
+endif
+
+; ---- Read host list ----------------------------------------------------------
+fileopen hosts_fh hosts_file 0 1
+if hosts_fh = -1 then
+    fileclose summary_fh
+    messagebox 'hosts.txt を開けませんでした。' 'Error'
+    ssh_pass = ''
+    ssh_pass_arg = ''
+    enable_pass = ''
+    end
+endif
+
+while 1
+    filereadln hosts_fh host
+    if result = 1 then
+        break
+    endif
+
+    strlen host
+    host_len = result
+
+    if host_len > 0 then
+        strcopy host 1 1 first_char
+
+        ; Lines beginning with # or ; are comments.
+        if first_char = '#' then
+            ; skip
+        elseif first_char = ';' then
+            ; skip
+        else
+            call process_host
+        endif
+    endif
+endwhile
+
+fileclose hosts_fh
+fileclose summary_fh
+
+; Clear runtime secrets.
+ssh_pass = ''
+ssh_pass_arg = ''
+enable_pass = ''
+
+messagebox '取得処理が完了しました。logs フォルダと capture_summary.txt を確認してください。' 'Completed'
+end
+
+
+; ============================================================================
+; process_host
+; ============================================================================
+:process_host
+
+host_abort = 0
+host_connected = 0
+cmd_index = 0
+
+sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host 'CONNECT' 'START' ''
+filewriteln summary_fh summary_line
+
+; Connect to SSH2.
+sprintf2 conn_cmd '%s /ssh /2 /auth=password /user="%s" /passwd="%s" /timeout=%d /NOLOG' host ssh_user_arg ssh_pass_arg LOGIN_TIMEOUT
+connect conn_cmd
+
+if result <> 2 then
+    sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host 'CONNECT' 'FAIL' 'connect result != 2'
+    filewriteln summary_fh summary_line
+    disconnect 0
+    pause RECONNECT_WAIT_SEC
+    return
+endif
+
+; Detect privileged/user EXEC prompt.
+timeout = LOGIN_TIMEOUT
+waitregex '.*#[ ]*$' '.*>[ ]*$'
+if result = 0 then
+    sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host 'LOGIN' 'FAIL' 'prompt timeout'
+    filewriteln summary_fh summary_line
+    disconnect 0
+    pause RECONNECT_WAIT_SEC
+    return
+endif
+
+; If user EXEC (>), enter enable mode.
+if result = 2 then
+    sendln 'enable'
+    timeout = LOGIN_TIMEOUT
+    waitregex '(?i).*password:[ ]*$' '.*#[ ]*$'
+
+    if result = 1 then
+        if enable_pass = '' then
+            sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host 'ENABLE' 'FAIL' 'enable password is empty'
+            filewriteln summary_fh summary_line
+            disconnect 0
+            pause RECONNECT_WAIT_SEC
+            return
+        endif
+
+        sendln enable_pass
+        timeout = LOGIN_TIMEOUT
+        waitregex '.*#[ ]*$'
+        if result = 0 then
+            sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host 'ENABLE' 'FAIL' 'enable prompt timeout'
+            filewriteln summary_fh summary_line
+            disconnect 0
+            pause RECONNECT_WAIT_SEC
+            return
+        endif
+    elseif result = 0 then
+        sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host 'ENABLE' 'FAIL' 'enable timeout'
+        filewriteln summary_fh summary_line
+        disconnect 0
+        pause RECONNECT_WAIT_SEC
+        return
+    endif
+endif
+
+host_connected = 1
+
+; Disable pager.
+sendln 'terminal length 0'
+timeout = LOGIN_TIMEOUT
+waitregex '.*#[ ]*$'
+if result = 0 then
+    sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host 'PAGER' 'FAIL' 'terminal length 0 timeout'
+    filewriteln summary_fh summary_line
+    disconnect 0
+    pause RECONNECT_WAIT_SEC
+    return
+endif
+
+; Start one log per host.
+sprintf2 host_log_name '%s_log.txt' host
+makepath host_log_file run_dir host_log_name
+logopen host_log_file 0 0 1 0 1
+if result = 1 then
+    sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host 'LOG' 'FAIL' 'logopen failed'
+    filewriteln summary_fh summary_line
+    disconnect 0
+    pause RECONNECT_WAIT_SEC
+    return
+endif
+
+sprintf2 log_line '===== HOST: %s =====' host
+logwrite log_line
+logwrite #13#10
+sprintf2 log_line '===== RUN : %s =====' run_name
+logwrite log_line
+logwrite #13#10
+
+; Open command list for this host.
+fileopen commands_fh commands_file 0 1
+if commands_fh = -1 then
+    logwrite 'ERROR: commands.txt open failed'
+    logwrite #13#10
+    logclose
+    sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host 'COMMANDS' 'FAIL' 'commands.txt open failed'
+    filewriteln summary_fh summary_line
+    disconnect 0
+    pause RECONNECT_WAIT_SEC
+    return
+endif
+
+while 1
+    filereadln commands_fh command
+    if result = 1 then
+        break
+    endif
+
+    strlen command
+    command_len = result
+
+    if command_len > 0 then
+        strcopy command 1 1 first_char
+
+        if first_char = '#' then
+            ; skip
+        elseif first_char = ';' then
+            ; skip
+        else
+            cmd_index = cmd_index + 1
+
+            logwrite #13#10
+            sprintf2 log_line '===== CMD %02d: %s =====' cmd_index command
+            logwrite log_line
+            logwrite #13#10
+
+            if capture_mode = 0 then
+                call run_terminal_command
+            else
+                call run_tftp_command
+            endif
+
+            if host_abort = 1 then
+                break
+            endif
+        endif
+    endif
+endwhile
+
+fileclose commands_fh
+
+logwrite #13#10
+logwrite '===== END ====='
+logwrite #13#10
+logclose
+
+disconnect 0
+pause RECONNECT_WAIT_SEC
+
+sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host 'HOST' 'DONE' ''
+filewriteln summary_fh summary_line
+return
+
+
+; ============================================================================
+; run_terminal_command
+; Sends command normally; output is captured by host_log.txt.
+; On prompt timeout, abort the current host to avoid sending another command
+; while the first command may still be running.
+; ============================================================================
+:run_terminal_command
+
+sendln command
+timeout = COMMAND_TIMEOUT
+waitregex '.*#[ ]*$'
+
+if result = 0 then
+    host_abort = 1
+    sprintf2 summary_line '%s,%s,CMD%02d,%s,%s' run_name host cmd_index 'TIMEOUT' command
+    filewriteln summary_fh summary_line
+    logwrite 'ERROR: command prompt timeout. Host processing aborted.'
+    logwrite #13#10
+else
+    sprintf2 summary_line '%s,%s,CMD%02d,%s,%s' run_name host cmd_index 'OK' command
+    filewriteln summary_fh summary_line
+endif
+
+return
+
+
+; ============================================================================
+; run_tftp_command
+; Executes:
+;   <command> | redirect tftp://<server>/<run>_<host>_cmdNN.txt
+;
+; Notes:
+;   - No TFTP destination file-size verification is performed here.
+;   - No automatic retry is performed.
+;   - If the Cisco prompt does not return, abort the current host.
+; ============================================================================
+:run_tftp_command
+
+sprintf2 tftp_filename '%s_%s_cmd%02d.txt' run_name host cmd_index
+sprintf2 tftp_url 'tftp://%s/%s' tftp_server tftp_filename
+sprintf2 redirect_command '%s | redirect %s' command tftp_url
+
+sprintf2 log_line 'TFTP redirect -> %s' tftp_filename
+logwrite log_line
+logwrite #13#10
+
+sendln redirect_command
+
+timeout = COMMAND_TIMEOUT
+waitregex '.*#[ ]*$'
+
+if result = 0 then
+    host_abort = 1
+    sprintf2 summary_line '%s,%s,CMD%02d,%s,%s' run_name host cmd_index 'TFTP_TIMEOUT' command
+    filewriteln summary_fh summary_line
+    logwrite 'ERROR: redirect command prompt timeout. Host processing aborted.'
+    logwrite #13#10
+else
+    sprintf2 summary_line '%s,%s,CMD%02d,%s,%s' run_name host cmd_index 'TFTP_SENT' tftp_filename
+    filewriteln summary_fh summary_line
+endif
+
+return
