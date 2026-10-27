@@ -135,7 +135,7 @@ TFTPサーバーはTera Term実行PCとは別機器でも問題ありません�
 
 - 実機Cisco IOS / IOS-XEでの認証フォールバック
 - 実際のAAA / enable設定差異
-- Windows端末上のTera Term + PowerShell + DPAPIの結合動作
+- Windows上のPowerShell構文とDPAPI暗号化・復号の往復はGitHub Actionsで確認済み。Tera Termを含む結合動作は未確認
 - 初回SSHホスト鍵確認やTTSSHダイアログの挙動
 - 利用中TFTPサーバーでの転送
 
