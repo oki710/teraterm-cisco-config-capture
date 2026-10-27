@@ -1,38 +1,42 @@
 ; ============================================================================
 ; Cisco IOS / IOS-XE multi-device command capture macro for Tera Term
-; Version: 0.2
+; Version: 0.3
 ;
-; Files:
-;   hosts.txt     : one host/IP per line
-;   commands.txt  : one EXEC "show" command per line
+; Authentication order:
+;   1. TACACS SSH (must reach privileged EXEC '#'; no enable)
+;   2. Common SSH (enable if initial prompt is '>')
+;   3. Common Telnet username/password (enable if initial prompt is '>')
+;
+; Credentials are supplied by start-capture.ps1 through process-scoped
+; environment variables. Run setup-credentials.ps1 once per Windows user.
 ;
 ; Output:
 ;   logs\YYYYMMDD_HHMM\<host>_log.txt
+;   logs\YYYYMMDD_HHMM\<host>_NG.txt       (all auth/privilege methods failed)
 ;   logs\YYYYMMDD_HHMM\capture_summary.txt
 ;
 ; Modes:
-;   0 = terminal logging (all command output -> <host>_log.txt)
+;   0 = terminal logging
 ;   1 = Cisco "show ... | redirect tftp://..."
 ;
-; TFTP mode policy:
-;   - Macro only executes redirect and records the Cisco-side result.
-;   - Destination file size / 0-byte verification is intentionally out of scope.
-;   - No automatic retry is performed.
-;
-; Requirements:
-;   - Tera Term Macro with: foldercreate, waitregex, strreplace
+; TFTP mode intentionally does not verify the destination file or retry.
 ; ============================================================================
 
-; ---- Tunables ---------------------------------------------------------------
 LOGIN_TIMEOUT        = 20
 COMMAND_TIMEOUT      = 180
 RECONNECT_WAIT_SEC   = 2
 
-; ---- Locate working files ---------------------------------------------------
+PROMPT_PRIV_RE = '.*#[ ]*$'
+PROMPT_USER_RE = '.*>[ ]*$'
+USERNAME_RE = '(?i).*(?:username|login|user name)[ ]*:[ ]*$'
+PASSWORD_RE = '(?i).*password[ ]*:[ ]*$'
+LOGIN_ERROR_RE = '(?i).*(?:authentication failed|login invalid|login incorrect|access denied|bad passwords|authentication failure).*'
+
 getdir base_dir
 makepath hosts_file base_dir 'hosts.txt'
 makepath commands_file base_dir 'commands.txt'
 makepath logs_root base_dir 'logs'
+makepath ini_path base_dir 'capture.ini'
 
 filesearch hosts_file
 if result = 0 then
@@ -46,13 +50,83 @@ if result = 0 then
     end
 endif
 
+filesearch ini_path
+if result = 0 then
+    messagebox 'capture.ini が見つかりません。TTL と同じフォルダに置いてください。' 'Error'
+    end
+endif
+
+; ---- Credentials: encrypted at rest by PowerShell/DPAPI, plaintext only in process memory.
+getenv 'TT_TACACS_USER' tacacs_user
+getenv 'TT_TACACS_PASS' tacacs_pass
+getenv 'TT_COMMON_SSH_USER' common_ssh_user
+getenv 'TT_COMMON_SSH_PASS' common_ssh_pass
+getenv 'TT_COMMON_SSH_ENABLE' common_ssh_enable
+getenv 'TT_COMMON_TELNET_USER' common_telnet_user
+getenv 'TT_COMMON_TELNET_PASS' common_telnet_pass
+getenv 'TT_COMMON_TELNET_ENABLE' common_telnet_enable
+
+; Reject incomplete method definitions before any connection.
+if tacacs_user = '' then
+    if tacacs_pass <> '' then
+        messagebox 'TACACS SSH のユーザー名がありません。setup-credentials.ps1 を再実行してください。' 'Credential error'
+        goto cleanup_secrets
+    endif
+else
+    if tacacs_pass = '' then
+        messagebox 'TACACS SSH のパスワードがありません。setup-credentials.ps1 を再実行してください。' 'Credential error'
+        goto cleanup_secrets
+    endif
+endif
+
+if common_ssh_user = '' then
+    if common_ssh_pass <> '' then
+        messagebox 'Common SSH のユーザー名がありません。setup-credentials.ps1 を再実行してください。' 'Credential error'
+        goto cleanup_secrets
+    endif
+else
+    if common_ssh_pass = '' then
+        messagebox 'Common SSH のパスワードがありません。setup-credentials.ps1 を再実行してください。' 'Credential error'
+        goto cleanup_secrets
+    endif
+    if common_ssh_enable = '' then
+        messagebox 'Common SSH の enable パスワードがありません。setup-credentials.ps1 を再実行してください。' 'Credential error'
+        goto cleanup_secrets
+    endif
+endif
+
+if common_telnet_user = '' then
+    if common_telnet_pass <> '' then
+        messagebox 'Common Telnet のユーザー名がありません。setup-credentials.ps1 を再実行してください。' 'Credential error'
+        goto cleanup_secrets
+    endif
+else
+    if common_telnet_pass = '' then
+        messagebox 'Common Telnet のパスワードがありません。setup-credentials.ps1 を再実行してください。' 'Credential error'
+        goto cleanup_secrets
+    endif
+    if common_telnet_enable = '' then
+        messagebox 'Common Telnet の enable パスワードがありません。setup-credentials.ps1 を再実行してください。' 'Credential error'
+        goto cleanup_secrets
+    endif
+endif
+
+strlen tacacs_user
+method_count = result
+strlen common_ssh_user
+method_count = method_count + result
+strlen common_telnet_user
+method_count = method_count + result
+if method_count = 0 then
+    messagebox '認証方式が1つも有効ではありません。setup-credentials.ps1 を実行してください。' 'Credential error'
+    goto cleanup_secrets
+endif
+
 foldercreate logs_root
 
-; ---- Create unique run folder: YYYYMMDD_HHMM[_02...] -----------------------
 gettime run_id '%Y%m%d_%H%M'
 run_name = run_id
 makepath run_dir logs_root run_name
-
 run_suffix = 2
 filesearch run_dir
 while result = 1
@@ -65,19 +139,17 @@ endwhile
 foldercreate run_dir
 if result <> 0 then
     messagebox 'ログ出力フォルダを作成できませんでした。' 'Error'
-    end
+    goto cleanup_secrets
 endif
 
 makepath summary_file run_dir 'capture_summary.txt'
 fileopen summary_fh summary_file 0
 if summary_fh = -1 then
     messagebox 'capture_summary.txt を作成できませんでした。' 'Error'
-    end
+    goto cleanup_secrets
 endif
-
 filewriteln summary_fh 'run,host,item,result,detail'
 
-; ---- Select capture mode ----------------------------------------------------
 inputbox '0 = 通常ログ取得（host_log.txt） / 1 = TFTP redirect' 'Capture mode' '0'
 mode_text = inputstr
 str2int capture_mode mode_text
@@ -88,52 +160,34 @@ if capture_mode <> 1 then
     capture_mode = 0
 endif
 
-; ---- Credentials: runtime only, never written to files ----------------------
-inputbox 'SSH ユーザー名' 'Cisco Login'
-ssh_user = inputstr
-
-passwordbox 'SSH パスワード' 'Cisco Login'
-ssh_pass = inputstr
-
-passwordbox 'enable パスワード（不要なら空欄）' 'Cisco Enable'
-enable_pass = inputstr
-
-; Escape quotes for TTSSH command line argument.
-ssh_user_arg = ssh_user
-ssh_pass_arg = ssh_pass
-strreplace ssh_user_arg 1 '"' '""'
-strreplace ssh_pass_arg 1 '"' '""'
-
-; ---- TFTP settings -----------------------------------------------------------
 if capture_mode = 1 then
     inputbox 'TFTPサーバーのIPアドレスまたは名前' 'TFTP Server'
     tftp_server = inputstr
 endif
 
-; ---- Link MACRO to a dedicated Tera Term instance without opening dialog ----
+; Link to a dedicated Tera Term instance before credentials are used.
+; Never reuse an existing linked Tera Term window on a shared terminal.
 testlink
-if result = 2 then
+if result <> 0 then
     fileclose summary_fh
-    messagebox '既存の接続済みTera Termからではなく、TTPMACRO.EXE でこのTTLを単独起動してください。' 'Error'
-    ssh_pass = ''
-    ssh_pass_arg = ''
-    enable_pass = ''
-    end
+    messagebox '既存のTera Termセッションからではなく、start-capture.cmd で単独起動してください。' 'Error'
+    goto cleanup_secrets
+endif
+sprintf2 bootstrap '/DS /NOLOG /AUTOWINCLOSE=off /F="%s"' ini_path
+connect bootstrap
+bootstrap = ''
+testlink
+if result <> 1 then
+    fileclose summary_fh
+    messagebox '専用Tera Termを起動できませんでした。capture.ini とTera Termの配置を確認してください。' 'Error'
+    goto cleanup_secrets
 endif
 
-if result = 0 then
-    connect '/DS /NOLOG'
-endif
-
-; ---- Read host list ----------------------------------------------------------
 fileopen hosts_fh hosts_file 0 1
 if hosts_fh = -1 then
     fileclose summary_fh
     messagebox 'hosts.txt を開けませんでした。' 'Error'
-    ssh_pass = ''
-    ssh_pass_arg = ''
-    enable_pass = ''
-    end
+    goto cleanup_secrets
 endif
 
 while 1
@@ -142,13 +196,10 @@ while 1
         break
     endif
 
+    strtrim host ' '#9
     strlen host
-    host_len = result
-
-    if host_len > 0 then
+    if result > 0 then
         strcopy host 1 1 first_char
-
-        ; Lines beginning with # or ; are comments.
         if first_char = '#' then
             ; skip
         elseif first_char = ';' then
@@ -162,105 +213,111 @@ endwhile
 fileclose hosts_fh
 fileclose summary_fh
 
-; Clear runtime secrets.
-ssh_pass = ''
-ssh_pass_arg = ''
-enable_pass = ''
-
 messagebox '取得処理が完了しました。logs フォルダと capture_summary.txt を確認してください。' 'Completed'
-end
+goto cleanup_secrets
 
 
 ; ============================================================================
 ; process_host
 ; ============================================================================
 :process_host
-
 host_abort = 0
-host_connected = 0
+login_ok = 0
+privilege_ok = 0
+auth_trace = ''
 cmd_index = 0
 
 sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host 'CONNECT' 'START' ''
 filewriteln summary_fh summary_line
 
-; Connect to SSH2.
-sprintf2 conn_cmd '%s /ssh /2 /auth=password /user="%s" /passwd="%s" /timeout=%d /NOLOG' host ssh_user_arg ssh_pass_arg LOGIN_TIMEOUT
-connect conn_cmd
+for auth_index 0 2
+    login_ok = 0
+    privilege_ok = 0
+    privilege_status = 'NOT_CHECKED'
 
-if result <> 2 then
-    sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host 'CONNECT' 'FAIL' 'connect result != 2'
-    filewriteln summary_fh summary_line
-    disconnect 0
-    pause RECONNECT_WAIT_SEC
-    return
-endif
-
-; Detect privileged/user EXEC prompt.
-timeout = LOGIN_TIMEOUT
-waitregex '.*#[ ]*$' '.*>[ ]*$'
-if result = 0 then
-    sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host 'LOGIN' 'FAIL' 'prompt timeout'
-    filewriteln summary_fh summary_line
-    disconnect 0
-    pause RECONNECT_WAIT_SEC
-    return
-endif
-
-; If user EXEC (>), enter enable mode.
-if result = 2 then
-    sendln 'enable'
-    timeout = LOGIN_TIMEOUT
-    waitregex '(?i).*password:[ ]*$' '.*#[ ]*$'
-
-    if result = 1 then
-        if enable_pass = '' then
-            sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host 'ENABLE' 'FAIL' 'enable password is empty'
-            filewriteln summary_fh summary_line
-            disconnect 0
-            pause RECONNECT_WAIT_SEC
-            return
+    if auth_index = 0 then
+        if tacacs_user = '' then
+            continue
         endif
-
-        sendln enable_pass
-        timeout = LOGIN_TIMEOUT
-        waitregex '.*#[ ]*$'
-        if result = 0 then
-            sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host 'ENABLE' 'FAIL' 'enable prompt timeout'
-            filewriteln summary_fh summary_line
-            disconnect 0
-            pause RECONNECT_WAIT_SEC
-            return
+        auth_method = 'TACACS_SSH'
+        active_user = tacacs_user
+        active_pass = tacacs_pass
+        call try_ssh
+    elseif auth_index = 1 then
+        if common_ssh_user = '' then
+            continue
         endif
-    elseif result = 0 then
-        sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host 'ENABLE' 'FAIL' 'enable timeout'
-        filewriteln summary_fh summary_line
-        disconnect 0
-        pause RECONNECT_WAIT_SEC
-        return
+        auth_method = 'COMMON_SSH'
+        active_user = common_ssh_user
+        active_pass = common_ssh_pass
+        call try_ssh
+    else
+        if common_telnet_user = '' then
+            continue
+        endif
+        auth_method = 'COMMON_TELNET'
+        call try_telnet
     endif
+
+    sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host auth_method auth_status 'AUTH'
+    filewriteln summary_fh summary_line
+
+    if login_ok <> 0 then
+        call prepare_privilege
+        sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host auth_method privilege_status 'PRIVILEGE'
+        filewriteln summary_fh summary_line
+    endif
+
+    if login_ok <> 0 then
+        if privilege_ok <> 0 then
+            break
+        endif
+    endif
+
+    sprintf2 trace_piece '%s:%s' auth_method auth_status
+    if login_ok <> 0 then
+        sprintf2 trace_piece '%s:%s/%s' auth_method auth_status privilege_status
+    endif
+    strlen auth_trace
+    if result > 0 then
+        strconcat auth_trace ';'
+    endif
+    strconcat auth_trace trace_piece
+
+    disconnect 0
+    pause RECONNECT_WAIT_SEC
+next
+
+if login_ok = 0 then
+    call write_ng_file
+    disconnect 0
+    pause RECONNECT_WAIT_SEC
+    return
+endif
+if privilege_ok = 0 then
+    call write_ng_file
+    disconnect 0
+    pause RECONNECT_WAIT_SEC
+    return
 endif
 
-host_connected = 1
-
-; Disable pager.
 sendln 'terminal length 0'
 timeout = LOGIN_TIMEOUT
-waitregex '.*#[ ]*$'
+waitregex PROMPT_PRIV_RE
 if result = 0 then
-    sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host 'PAGER' 'FAIL' 'terminal length 0 timeout'
-    filewriteln summary_fh summary_line
+    auth_trace = 'terminal length 0 timeout'
+    call write_ng_file
     disconnect 0
     pause RECONNECT_WAIT_SEC
     return
 endif
 
-; Start one log per host.
 sprintf2 host_log_name '%s_log.txt' host
 makepath host_log_file run_dir host_log_name
 logopen host_log_file 0 0 1 0 1
 if result = 1 then
-    sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host 'LOG' 'FAIL' 'logopen failed'
-    filewriteln summary_fh summary_line
+    auth_trace = 'logopen failed'
+    call write_ng_file
     disconnect 0
     pause RECONNECT_WAIT_SEC
     return
@@ -269,11 +326,13 @@ endif
 sprintf2 log_line '===== HOST: %s =====' host
 logwrite log_line
 logwrite #13#10
+sprintf2 log_line '===== AUTH: %s =====' auth_method
+logwrite log_line
+logwrite #13#10
 sprintf2 log_line '===== RUN : %s =====' run_name
 logwrite log_line
 logwrite #13#10
 
-; Open command list for this host.
 fileopen commands_fh commands_file 0 1
 if commands_fh = -1 then
     logwrite 'ERROR: commands.txt open failed'
@@ -292,19 +351,16 @@ while 1
         break
     endif
 
+    strtrim command ' '#9
     strlen command
-    command_len = result
-
-    if command_len > 0 then
+    if result > 0 then
         strcopy command 1 1 first_char
-
         if first_char = '#' then
             ; skip
         elseif first_char = ';' then
             ; skip
         else
             cmd_index = cmd_index + 1
-
             logwrite #13#10
             sprintf2 log_line '===== CMD %02d: %s =====' cmd_index command
             logwrite log_line
@@ -324,7 +380,6 @@ while 1
 endwhile
 
 fileclose commands_fh
-
 logwrite #13#10
 logwrite '===== END ====='
 logwrite #13#10
@@ -333,22 +388,223 @@ logclose
 disconnect 0
 pause RECONNECT_WAIT_SEC
 
-sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host 'HOST' 'DONE' ''
+sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host 'HOST' 'DONE' auth_method
+filewriteln summary_fh summary_line
+return
+
+
+; ============================================================================
+; try_ssh
+; ============================================================================
+:try_ssh
+ssh_user_arg = active_user
+ssh_pass_arg = active_pass
+strreplace ssh_user_arg 1 '"' '""'
+strreplace ssh_pass_arg 1 '"' '""'
+
+sprintf2 conn_cmd '%s /ssh /2 /auth=password /user="%s" /passwd="%s" /timeout=%d /NOLOG' host ssh_user_arg ssh_pass_arg LOGIN_TIMEOUT
+connect conn_cmd
+conn_cmd = ''
+ssh_user_arg = ''
+ssh_pass_arg = ''
+active_user = ''
+active_pass = ''
+
+if result <> 2 then
+    auth_status = 'SSH_NOT_CONNECTED'
+    return
+endif
+
+timeout = LOGIN_TIMEOUT
+waitregex PROMPT_PRIV_RE PROMPT_USER_RE LOGIN_ERROR_RE USERNAME_RE PASSWORD_RE
+if result = 1 then
+    learned_prompt = matchstr
+    login_ok = 1
+    auth_status = 'EXEC_PROMPT_REACHED'
+elseif result = 2 then
+    learned_prompt = matchstr
+    login_ok = 1
+    auth_status = 'EXEC_PROMPT_REACHED'
+elseif result = 3 then
+    auth_status = 'SSH_AUTH_REJECTED'
+elseif result = 0 then
+    auth_status = 'SSH_EXEC_TIMEOUT'
+else
+    auth_status = 'SSH_EXTRA_AUTH_PROMPT'
+endif
+return
+
+
+; ============================================================================
+; try_telnet - username/password Telnet login
+; ============================================================================
+:try_telnet
+sprintf2 conn_cmd '%s:23 /nossh /T=1 /timeout=%d /NOLOG' host LOGIN_TIMEOUT
+connect conn_cmd
+conn_cmd = ''
+
+if result <> 2 then
+    auth_status = 'TELNET_NOT_CONNECTED'
+    return
+endif
+
+timeout = LOGIN_TIMEOUT
+waitregex PROMPT_PRIV_RE PROMPT_USER_RE USERNAME_RE PASSWORD_RE LOGIN_ERROR_RE
+telnet_result = result
+
+if telnet_result = 1 then
+    learned_prompt = matchstr
+    login_ok = 1
+    auth_status = 'EXEC_PROMPT_REACHED'
+    return
+elseif telnet_result = 2 then
+    learned_prompt = matchstr
+    login_ok = 1
+    auth_status = 'EXEC_PROMPT_REACHED'
+    return
+elseif telnet_result = 3 then
+    sendln common_telnet_user
+    timeout = LOGIN_TIMEOUT
+    waitregex PASSWORD_RE PROMPT_PRIV_RE PROMPT_USER_RE LOGIN_ERROR_RE USERNAME_RE
+    telnet_result = result
+    if telnet_result = 2 then
+        learned_prompt = matchstr
+        login_ok = 1
+        auth_status = 'EXEC_PROMPT_REACHED'
+        return
+    elseif telnet_result = 3 then
+        learned_prompt = matchstr
+        login_ok = 1
+        auth_status = 'EXEC_PROMPT_REACHED'
+        return
+    elseif telnet_result <> 1 then
+        auth_status = 'TELNET_USERNAME_REJECTED'
+        return
+    endif
+elseif telnet_result = 4 then
+    ; Password-first devices are accepted, but username/password AAA is preferred.
+else
+    if telnet_result = 0 then
+        auth_status = 'TELNET_LOGIN_TIMEOUT'
+    else
+        auth_status = 'TELNET_AUTH_REJECTED'
+    endif
+    return
+endif
+
+sendln common_telnet_pass
+timeout = LOGIN_TIMEOUT
+waitregex PROMPT_PRIV_RE PROMPT_USER_RE LOGIN_ERROR_RE PASSWORD_RE USERNAME_RE
+if result = 1 then
+    learned_prompt = matchstr
+    login_ok = 1
+    auth_status = 'EXEC_PROMPT_REACHED'
+elseif result = 2 then
+    learned_prompt = matchstr
+    login_ok = 1
+    auth_status = 'EXEC_PROMPT_REACHED'
+elseif result = 0 then
+    auth_status = 'TELNET_EXEC_TIMEOUT'
+else
+    auth_status = 'TELNET_AUTH_REJECTED'
+endif
+return
+
+
+; ============================================================================
+; prepare_privilege
+; TACACS is expected to land directly at '#'. Common methods may use enable.
+; ============================================================================
+:prepare_privilege
+privilege_ok = 0
+strmatch learned_prompt '#[ ]*$'
+if result > 0 then
+    privilege_status = 'READY'
+    privilege_ok = 1
+    return
+endif
+
+strmatch learned_prompt '>[ ]*$'
+if result = 0 then
+    privilege_status = 'UNEXPECTED_EXEC_PROMPT'
+    return
+endif
+
+if auth_index = 0 then
+    privilege_status = 'TACACS_NOT_PRIVILEGED'
+    return
+endif
+
+if auth_index = 1 then
+    active_enable_pass = common_ssh_enable
+else
+    active_enable_pass = common_telnet_enable
+endif
+
+sendln 'enable'
+timeout = LOGIN_TIMEOUT
+waitregex PASSWORD_RE PROMPT_PRIV_RE LOGIN_ERROR_RE PROMPT_USER_RE
+enable_result = result
+
+if enable_result = 2 then
+    learned_prompt = matchstr
+    privilege_status = 'READY'
+    privilege_ok = 1
+    active_enable_pass = ''
+    return
+endif
+
+if enable_result <> 1 then
+    privilege_status = 'ENABLE_FAILED'
+    active_enable_pass = ''
+    return
+endif
+
+sendln active_enable_pass
+active_enable_pass = ''
+timeout = LOGIN_TIMEOUT
+waitregex PROMPT_PRIV_RE LOGIN_ERROR_RE PASSWORD_RE PROMPT_USER_RE
+if result = 1 then
+    learned_prompt = matchstr
+    privilege_status = 'READY'
+    privilege_ok = 1
+else
+    privilege_status = 'ENABLE_FAILED'
+endif
+return
+
+
+; ============================================================================
+; write_ng_file
+; ============================================================================
+:write_ng_file
+sprintf2 ng_name '%s_NG.txt' host
+makepath ng_file run_dir ng_name
+fileopen ng_fh ng_file 0
+if ng_fh <> -1 then
+    gettime ng_time '%Y-%m-%d %H:%M:%S'
+    filewriteln ng_fh 'result=NG'
+    sprintf2 ng_line 'host=%s' host
+    filewriteln ng_fh ng_line
+    sprintf2 ng_line 'time=%s' ng_time
+    filewriteln ng_fh ng_line
+    filewriteln ng_fh 'reason=authentication_or_privilege_failed'
+    sprintf2 ng_line 'attempts=%s' auth_trace
+    filewriteln ng_fh ng_line
+    fileclose ng_fh
+endif
+sprintf2 summary_line '%s,%s,%s,%s,%s' run_name host 'HOST' 'NG' auth_trace
 filewriteln summary_fh summary_line
 return
 
 
 ; ============================================================================
 ; run_terminal_command
-; Sends command normally; output is captured by host_log.txt.
-; On prompt timeout, abort the current host to avoid sending another command
-; while the first command may still be running.
 ; ============================================================================
 :run_terminal_command
-
 sendln command
 timeout = COMMAND_TIMEOUT
-waitregex '.*#[ ]*$'
+waitregex PROMPT_PRIV_RE
 
 if result = 0 then
     host_abort = 1
@@ -360,22 +616,13 @@ else
     sprintf2 summary_line '%s,%s,CMD%02d,%s,%s' run_name host cmd_index 'OK' command
     filewriteln summary_fh summary_line
 endif
-
 return
 
 
 ; ============================================================================
 ; run_tftp_command
-; Executes:
-;   <command> | redirect tftp://<server>/<run>_<host>_cmdNN.txt
-;
-; Notes:
-;   - No TFTP destination file-size verification is performed here.
-;   - No automatic retry is performed.
-;   - If the Cisco prompt does not return, abort the current host.
 ; ============================================================================
 :run_tftp_command
-
 sprintf2 tftp_filename '%s_%s_cmd%02d.txt' run_name host cmd_index
 sprintf2 tftp_url 'tftp://%s/%s' tftp_server tftp_filename
 sprintf2 redirect_command '%s | redirect %s' command tftp_url
@@ -385,9 +632,8 @@ logwrite log_line
 logwrite #13#10
 
 sendln redirect_command
-
 timeout = COMMAND_TIMEOUT
-waitregex '.*#[ ]*$'
+waitregex PROMPT_PRIV_RE
 
 if result = 0 then
     host_abort = 1
@@ -399,5 +645,22 @@ else
     sprintf2 summary_line '%s,%s,CMD%02d,%s,%s' run_name host cmd_index 'TFTP_SENT' tftp_filename
     filewriteln summary_fh summary_line
 endif
-
 return
+
+
+:cleanup_secrets
+tacacs_user = ''
+tacacs_pass = ''
+common_ssh_user = ''
+common_ssh_pass = ''
+common_ssh_enable = ''
+common_telnet_user = ''
+common_telnet_pass = ''
+common_telnet_enable = ''
+active_user = ''
+active_pass = ''
+active_enable_pass = ''
+ssh_user_arg = ''
+ssh_pass_arg = ''
+conn_cmd = ''
+end
