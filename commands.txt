@@ -1,0 +1,4 @@
+# 1行に1コマンド。EXECモードの show コマンドを想定。
+show running-config
+show version
+show inventory
