@@ -1,0 +1,62 @@
+name: temporary-secure-auth-tests
+
+on:
+  push:
+    branches:
+      - feature/secure-auth-fallback
+  workflow_dispatch:
+
+jobs:
+  windows-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse PowerShell files and verify DPAPI round-trip
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($file in @('setup-credentials.ps1','start-capture.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Join-Path $PWD $file), [ref]$tokens, [ref]$errors
+            ) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | Format-List | Out-String | Write-Error
+            }
+          }
+
+          $plain = 'DPAPI_SMOKE_TEST_ONLY'
+          $secure = ConvertTo-SecureString -String $plain -AsPlainText -Force
+          $cipher = ConvertFrom-SecureString -SecureString $secure
+          $round = ConvertTo-SecureString -String $cipher
+          $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($round)
+          try {
+            $value = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+          } finally {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+          }
+          if ($value -ne $plain) { throw 'DPAPI round-trip failed' }
+
+      - name: Check capture TTL auth policy and structure
+        shell: powershell
+        run: |
+          $ttl = Get-Content -LiteralPath .\capture.ttl -Raw
+          $required = @(
+            'TT_TACACS_USER','TT_TACACS_PASS',
+            'TT_COMMON_SSH_USER','TT_COMMON_SSH_PASS','TT_COMMON_SSH_ENABLE',
+            'TT_COMMON_TELNET_USER','TT_COMMON_TELNET_PASS','TT_COMMON_TELNET_ENABLE'
+          )
+          foreach ($name in $required) {
+            if (-not $ttl.Contains($name)) { throw "Missing env var: $name" }
+          }
+          $a = $ttl.IndexOf("auth_method = 'TACACS_SSH'")
+          $b = $ttl.IndexOf("auth_method = 'COMMON_SSH'")
+          $c = $ttl.IndexOf("auth_method = 'COMMON_TELNET'")
+          if (-not ($a -ge 0 -and $a -lt $b -and $b -lt $c)) {
+            throw 'Authentication fallback order is invalid'
+          }
+          foreach ($needle in @("TACACS_NOT_PRIVILEGED","_NG.txt","result=NG","capture.ini")) {
+            if (-not $ttl.Contains($needle)) { throw "Missing TTL policy marker: $needle" }
+          }
+          if ($ttl -match '(?i)passwordbox') { throw 'passwordbox must not be used for stored credentials' }
